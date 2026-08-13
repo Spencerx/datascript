@@ -436,6 +436,36 @@ function test_tuple_index() {
   assert_eq([3, 1, 2], eids(d.datoms(db, ":avet", "xs")));
 }
 
+function test_tuple_read_refs() {
+  var schema = {"name":     {":db/unique": ":db.unique/identity"},
+                "ref+long": {":db/valueType": ":db.type/tuple",
+                             ":db/tupleTypes": [":db.type/ref", ":db.type/long"],
+                             ":db/index": true},
+                "refs":     {":db/valueType": ":db.type/tuple",
+                             ":db/tupleType": ":db.type/ref",
+                             ":db/index": true}};
+  var db = d.db_with(d.empty_db(schema),
+                     [{":db/id": 1, "name": "Ivan"},
+                      {":db/id": 2, "name": "Oleg"},
+                      [":db/add", 2, "ref+long", [1, 7]],
+                      [":db/add", 2, "refs", [1, 2]]]);
+
+  // lookup refs in ref slots are resolved on read, too
+  assert_eq([2], eids(d.datoms(db, ":avet", "ref+long", [["name", "Ivan"], 7])));
+  assert_eq([2], eids(d.datoms(db, ":eavt", 2, "ref+long", [["name", "Ivan"], 7])));
+  assert_eq(2,   eids(d.seek_datoms(db, ":avet", "ref+long", [["name", "Ivan"], 7]))[0]);
+  assert_eq([2], eids(d.index_range(db, "ref+long", [["name", "Ivan"], 7], [["name", "Ivan"], 8])));
+  assert_eq([2], eids(d.datoms(db, ":avet", "refs", [["name", "Ivan"], ["name", "Oleg"]])));
+
+  // and in queries
+  assert_eq_set([[2]], d.q('[:find ?e :where [?e "ref+long" [["name" "Ivan"] 7]]]', db));
+  assert_eq_set([[2]], d.q('[:find ?e :where [?e "refs" [["name" "Ivan"] ["name" "Oleg"]]]]', db));
+
+  // unresolved refs raise
+  assert_throws('Nothing found for entity id ["name" "Petr"]',
+    function() { d.datoms(db, ":avet", "ref+long", [["name", "Petr"], 7]); });
+}
+
 function test_tuple_many() {
   var schema = {"locs": {":db/valueType": ":db.type/tuple",
                          ":db/tupleTypes": [":db.type/long", ":db.type/long"],
@@ -867,6 +897,7 @@ function test_datascript_js() {
                     test_tuple_refs,
                     test_tuple_unique,
                     test_tuple_index,
+                    test_tuple_read_refs,
                     test_tuple_many,
                     test_tuple_cas,
                     test_tuple_serialize,

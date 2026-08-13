@@ -640,3 +640,129 @@
         db' (d/from-serializable (d/serializable db))]
     (is (= (tdc/all-datoms db) (tdc/all-datoms db')))
     (is (= (:schema db) (:schema db')))))
+
+;; issue-427
+
+(def read-refs-schema
+  {:name     {:db/unique :db.unique/identity}
+   :ref      {:db/valueType :db.type/ref}
+   :ref+name {:db/valueType :db.type/tuple
+              :db/tupleAttrs [:ref :name]
+              :db/unique :db.unique/identity}
+   :ref+long {:db/valueType :db.type/tuple
+              :db/tupleTypes [:db.type/ref :db.type/long]
+              :db/index true}
+   :long+ref {:db/valueType :db.type/tuple
+              :db/tupleTypes [:db.type/long :db.type/ref]
+              :db/index true}
+   :refs     {:db/valueType :db.type/tuple
+              :db/tupleType :db.type/ref
+              :db/index true}})
+
+(def *read-refs-db
+  (delay
+    (-> (d/empty-db read-refs-schema)
+      (d/db-with [{:db/id 1 :name "Ivan" :db/ident :ivan}
+                  {:db/id 2 :name "Oleg" :ref 1}
+                  [:db/add 2 :ref+long [1 7]]
+                  [:db/add 2 :long+ref [7 1]]
+                  [:db/add 2 :refs [1 2]]]))))
+
+(deftest test-read-refs
+  (let [db @*read-refs-db
+        es #(mapv :e %)]
+    (testing "datoms"
+      (are [v] (= [2] (es (d/datoms db :avet :ref+long v)))
+        [1 7]
+        [[:name "Ivan"] 7]
+        [:ivan 7])
+
+      (are [v] (= [2] (es (d/datoms db :eavt 2 :ref+long v)))
+        [1 7]
+        [[:name "Ivan"] 7]
+        [:ivan 7])
+
+      (testing "composite tuples"
+        (are [v] (= [2] (es (d/datoms db :avet :ref+name v)))
+          [1 "Oleg"]
+          [[:name "Ivan"] "Oleg"]
+          [:ivan "Oleg"])
+
+        (is (= [1] (es (d/datoms db :avet :ref+name [nil "Ivan"])))))
+
+      (testing "homogeneous tuples resolve every slot"
+        (are [v] (= [2] (es (d/datoms db :avet :refs v)))
+          [1 2]
+          [[:name "Ivan"] [:name "Oleg"]]
+          [:ivan [:name "Oleg"]]))
+
+      (testing "non-ref slots are not resolved"
+        (is (= [2] (es (d/datoms db :avet :long+ref [7 [:name "Ivan"]]))))
+        (is (= [] (es (d/datoms db :avet :long+ref [[:name "Ivan"] 1]))))))
+
+    (testing "seek-datoms, rseek-datoms, find-datom, index-range"
+      (is (= [2] (es (take 1 (d/seek-datoms db :avet :ref+long [[:name "Ivan"] 7])))))
+      (is (= [2] (es (take 1 (d/rseek-datoms db :avet :ref+long [[:name "Ivan"] 7])))))
+      (is (= 2 (:e (d/find-datom db :avet :ref+long [[:name "Ivan"] 7]))))
+      (is (= [2] (es (d/index-range db :ref+long [[:name "Ivan"] 7] [[:name "Ivan"] 8]))))
+      (is (= [2] (es (d/index-range db :refs [:ivan [:name "Ivan"]] [:ivan [:name "Oleg"]])))))
+
+    (testing "entity, pull"
+      (are [eid] (= 2 (:db/id (d/entity db eid)))
+        [:ref+name [1 "Oleg"]]
+        [:ref+name [[:name "Ivan"] "Oleg"]]
+        [:ref+name [:ivan "Oleg"]])
+
+      (is (= {:name "Oleg"} (d/pull db [:name] [:ref+name [:ivan "Oleg"]])))
+
+      (testing "nil value in lookup ref"
+        (is (nil? (d/entity db [:ref+name nil]))))
+
+      (testing "extra elements are not silently truncated"
+        (is (nil? (d/entity db [:ref+name [1 "Oleg" "extra"]])))))
+
+    (testing "unresolved refs raise"
+      (is (thrown-msg? "Nothing found for entity id [:name \"Petr\"]"
+            (vec (d/datoms db :avet :ref+long [[:name "Petr"] 7]))))
+      (is (thrown-msg? "Nothing found for entity id :petr"
+            (vec (d/datoms db :avet :ref+long [:petr 7]))))
+      (is (thrown-msg? "Nothing found for entity id [:name \"Petr\"]"
+            (d/q '[:find ?e :where [?e :ref+long [[:name "Petr"] 7]]] db))))
+
+    (testing "arity is validated"
+      (is (thrown-with-msg? ExceptionInfo #"Attribute :ref\+long expected a 2-element vector, got: \[1\]"
+            (vec (d/datoms db :avet :ref+long [1])))))))
+
+(deftest test-read-refs-queries
+  (let [db @*read-refs-db]
+    (testing "constant in pattern"
+      (are [q] (= #{[2]} (d/q q db))
+        '[:find ?e :where [?e :ref+long [[:name "Ivan"] 7]]]
+        '[:find ?e :where [?e :ref+long [:ivan 7]]]
+        '[:find ?e :where [?e :ref+name [[:name "Ivan"] "Oleg"]]]
+        '[:find ?e :where [?e :refs [[:name "Ivan"] [:name "Oleg"]]]]
+        '[:find ?e :where [?e :long+ref [7 [:name "Ivan"]]]]))
+
+    (testing "tuple passed as an input"
+      (is (= #{[2]} (d/q '[:find ?e
+                           :in $ ?t
+                           :where [?e :ref+long ?t]]
+                      db [[:name "Ivan"] 7]))))
+
+    (testing "tuples bound as a collection"
+      (is (= #{[2]} (d/q '[:find ?e
+                           :in $ [?t ...]
+                           :where [?e :ref+long ?t]]
+                      db [[[:name "Ivan"] 7] [[:name "Oleg"] 8]])))
+
+      (is (= #{[2]} (d/q '[:find ?e
+                           :in $ [?t ...]
+                           :where [?e :refs ?t]]
+                      db [[:ivan [:name "Oleg"]]]))))
+
+    (testing "tuple in a rule"
+      (is (= #{[2]} (d/q '[:find ?e
+                           :in $ %
+                           :where (ref+long ?e)]
+                      db '[[(ref+long ?e)
+                            [?e :ref+long [[:name "Ivan"] 7]]]]))))))

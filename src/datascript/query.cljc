@@ -263,7 +263,8 @@
 ;;
 
 (def ^{:dynamic true
-       :doc "List of symbols in current pattern that might potentiall be resolved to refs"}
+       :doc "Map of symbol in current pattern that might potentially be resolved to refs
+             => fn that resolves its values"}
   *lookup-attrs* nil)
 
 (def ^{:dynamic true
@@ -272,7 +273,7 @@
 
 (defn getter-fn [attrs attr]
   (let [idx (attrs attr)]
-    (if (contains? *lookup-attrs* attr)
+    (if-some [resolve-fn (get *lookup-attrs* attr)]
       (if (int? idx)
         (let [idx (int idx)]
           (fn contained-int-getter-fn [tuple]
@@ -282,8 +283,8 @@
                                 (nth tuple idx)))]
               (cond
                 (number? eid)     eid ;; quick path to avoid fn call
-                (sequential? eid) (db/entid *implicit-source* eid)
-                (da/array? eid)   (db/entid *implicit-source* eid)
+                (sequential? eid) (resolve-fn eid)
+                (da/array? eid)   (resolve-fn eid)
                 :else             eid))))
         ;; If the index is not an int?, the target can never be an array
         (fn contained-getter-fn [tuple]
@@ -291,8 +292,8 @@
                        :clj (.valAt ^ILookup tuple idx))]
             (cond
               (number? eid)     eid ;; quick path to avoid fn call
-              (sequential? eid) (db/entid *implicit-source* eid)
-              (da/array? eid)   (db/entid *implicit-source* eid)
+              (sequential? eid) (resolve-fn eid)
+              (da/array? eid)   (resolve-fn eid)
               :else             eid))))
       (if (int? idx)
         (let [idx (int idx)]
@@ -405,8 +406,19 @@
           e'         (if (or (lookup-ref? e) (attr? e))
                        (db/entid-strict source e)
                        e)
-          v'         (if (and v (attr? a) (db/ref? source a) (or (lookup-ref? v) (attr? v)))
-                       (db/entid-strict source v)
+          v'         (cond
+                       (or (nil? v) (not (attr? a)))
+                       v
+
+                       (db/ref? source a)
+                       (if (or (lookup-ref? v) (attr? v))
+                         (db/entid-strict source v)
+                         v)
+
+                       (and (db/tuple? source a) (sequential? v))
+                       (db/resolve-tuple-refs source a v pattern)
+
+                       :else
                        v)
           tx'        (if (lookup-ref? tx)
                        (db/entid-strict source tx)
@@ -686,15 +698,18 @@
                         rel))))))))
         rel))))
 
+(defn- resolve-eid [eid]
+  (db/entid *implicit-source* eid))
+
 (defn dynamic-lookup-attrs [source pattern]
-  (let [[e a v tx] pattern]
-    (cond-> #{}
-      (free-var? e) (conj e)
-      (free-var? tx) (conj tx)
-      (and
-        (free-var? v)
-        (not (free-var? a))
-        (db/ref? source a)) (conj v))))
+  (let [[e a v tx] pattern
+        v-ref?     (and (free-var? v) (attr? a) (db/ref? source a))
+        v-tuple?   (and (free-var? v) (attr? a) (db/tuple? source a))]
+    (cond-> {}
+      (free-var? e)  (assoc e  resolve-eid)
+      (free-var? tx) (assoc tx resolve-eid)
+      v-ref?         (assoc v  resolve-eid)
+      v-tuple?       (assoc v  #(db/resolve-tuple-refs *implicit-source* a %1 pattern)))))
 
 (defn limit-rel [rel vars]
   (when-some [attrs' (not-empty (select-keys (:attrs rel) vars))]

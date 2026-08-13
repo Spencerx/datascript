@@ -89,7 +89,11 @@
       versions have no ^:declared meta, thus allowing CLJS to generate direct
       invocations and see type hints."
      [name & rest]
-     (let [name'    (vary-meta name patch-tag (cljs-env? &env))
+     (let [[doc rest] (if (string? (first rest))
+                        [(first rest) (next rest)]
+                        [nil rest])
+           name'    (cond-> (vary-meta name patch-tag (cljs-env? &env))
+                      doc (vary-meta assoc :doc doc))
            arglists (if (vector? (first rest))
                       [(first rest)]
                       (map #(list (first %)) rest))]
@@ -1163,15 +1167,23 @@
 #?(:clj  (declare ref?)
    :cljs (defn ^boolean ref? [db attr]))
 
+#?(:clj  (declare tuple?)
+   :cljs (defn ^boolean tuple? [db attr]))
+
+#?(:clj  (declare resolve-tuple-refs)
+   :cljs (defn resolve-tuple-refs [db a vs context]))
+
 (defn+ resolve-datom [db e a v t default-e default-tx]
   (when (some? a)
     (validate-attr a (list 'resolve-datom 'db e a v t)))
   (datom
     (if (some? e) (entid-strict db e) default-e)
     a
-    (if (and (some? v) (ref? db a))
-      (entid-strict db v)
-      v)
+    (cond
+      (nil? v)      v
+      (ref? db a)   (entid-strict db v)
+      (tuple? db a) (resolve-tuple-refs db a v (list 'resolve-datom 'db e a v t))
+      :else         v)
     (if (some? t) (entid-strict db t) default-tx)))
 
 (defn+ components->pattern [db index c0 c1 c2 c3 default-e default-tx]
@@ -1271,38 +1283,38 @@
          (util/raise "Attribute " a " expected a vector, got: " v " in " context
            {:error :transact/syntax, :attribute a, :value v, :context context}))))))
 
-(defn resolve-tuple-refs [db a vs context]
-  (let [attr (-> db -schema (get a))]
-    (validate-tuple db a attr vs context)
-    (cond
-      (not (sequential? vs)) ;; e.g. nil ov in :db.fn/cas
+(defn- #?@(:clj  [^Boolean tuple-ref-slot?]
+           :cljs [^boolean tuple-ref-slot?])
+  [db schema-a idx]
+  (cond
+    (:db/tupleAttrs schema-a) (ref? db (nth (:db/tupleAttrs schema-a) idx nil))
+    (:db/tupleTypes schema-a) (= :db.type/ref (nth (:db/tupleTypes schema-a) idx nil))
+    :else                     (= :db.type/ref (:db/tupleType schema-a))))
+
+(defn- #?@(:clj  [^Boolean resolved-eid?]
+           :cljs [^boolean resolved-eid?])
+  [x]
+  (or
+    (nil? x)
+    (and (number? x) (not (neg? x)))))
+
+(defn+ resolve-tuple-refs
+  "Resolves lookup refs and idents in ref slots of a tuple value.
+   Read path: no tempids, unresolved refs raise"
+  [db a vs context]
+  (let [schema-a (-> db -schema (get a))]
+    (validate-tuple db a schema-a vs context)
+    (if-not (sequential? vs) ;; e.g. nil ov in :db.fn/cas
       vs
-
-      (:db/tupleAttrs attr)
-      (mapv
-        (fn [el-a v]
-          (if (and (ref? db el-a) (sequential? v)) ;; lookup-ref
-            (entid-strict db v)
-            v))
-        (:db/tupleAttrs attr) vs)
-
-      (:db/tupleTypes attr)
-      (mapv
-        (fn [el-type v]
-          (if (and (= :db.type/ref el-type) (sequential? v)) ;; lookup-ref
-            (entid-strict db v)
-            v))
-        (:db/tupleTypes attr) vs)
-
-      (= :db.type/ref (:db/tupleType attr))
-      (mapv (fn [v]
-              (if (sequential? v) ;; lookup-ref
-                (entid-strict db v)
-                v))
-        vs)
-
-      :else
-      vs)))
+      (into []
+        (map-indexed
+          (fn [idx v]
+            (if (and
+                  (tuple-ref-slot? db schema-a idx)
+                  (not (resolved-eid? v)))
+              (entid-strict db v)
+              v)))
+        vs))))
 
 (defn+ ^number entid [db eid]
   {:pre [(db? db)]}
@@ -1323,13 +1335,13 @@
         (util/raise "Lookup ref attribute should be marked as :db/unique: " eid
           {:error :lookup-ref/unique, :entity-id eid})
         
+        (nil? value)
+        nil
+
         (tuple? db attr)
         (let [value' (resolve-tuple-refs db attr value eid)]
           (-> (-datoms db :avet attr value' nil nil) first :e))
-        
-        (nil? value)
-        nil
-        
+
         :else
         (-> (-datoms db :avet attr value nil nil) first :e)))
     
@@ -1468,7 +1480,8 @@
     (auto-tempid? x)))
 
 (defn- new-eid? [db eid]
-  (and (> eid (:max-eid db))
+  (and
+    (> eid (:max-eid db))
     (< eid tx0))) ;; tx0 is max eid
 
 (defn- advance-max-eid [db eid]
@@ -1497,83 +1510,43 @@
      true
      (update :db-after advance-max-eid eid))))
 
-(defn- #?@(:clj  [^Boolean tuple-slot-resolved?]
-           :cljs [^boolean tuple-slot-resolved?])
-  [x]
-  (or
-    (nil? x)
-    (and (number? x) (not (neg? x)))))
-
-(defn- resolve-tuple-slot [report v]
-  (let [db (:db-after report)]
-    (cond
-      (tuple-slot-resolved? v)
-      [report v]
-
-      (tx-id? v)
-      (let [id (current-tx report)]
-        [(allocate-eid report v id) id])
-
-      (tempid? v)
-      (if-some [resolved (get (:tempids report) v)]
-        [(update report ::value-tempids assoc resolved v) resolved]
-        (let [resolved (next-eid db)]
-          [(-> report
-             (allocate-eid v resolved)
-             (update ::value-tempids assoc resolved v))
-           resolved]))
-
-      :else ;; lookup ref or ident
-      [report (entid-strict db v)])))
-
 (defn- resolve-tuple-value
   "Resoleves refs, tempids and :db/current-tx in ref slots. Returns [report' vs']"
   [report a vs context]
-  (let [db   (:db-after report)
-        attr (-> db -schema (get a))
-        _    (validate-tuple db a attr vs context)]
-    (cond
-      (not (vector? vs))
+  (let [db       (:db-after report)
+        schema-a (-> db -schema (get a))
+        _        (validate-tuple db a schema-a vs context)]
+    (if-not (vector? vs)
       [report vs]
-
-      (:db/tupleAttrs attr)
-      (let [el-attrs (:db/tupleAttrs attr)]
-        (loop [idx     0
-               report' report
-               vs'     (transient [])]
-          (if (>= idx (count vs))
-            [report' (persistent! vs')]
-            (let [v (nth vs idx)]
-              (if (ref? db (nth el-attrs idx nil))
-                (let [[report'' v'] (resolve-tuple-slot report' v)]
-                  (recur (inc idx) report'' (conj! vs' v')))
-                (recur (inc idx) report' (conj! vs' v)))))))
-
-      (:db/tupleTypes attr)
-      (let [types (:db/tupleTypes attr)]
-        (loop [idx     0
-               report' report
-               vs'     (transient [])]
-          (if (>= idx (count vs))
-            [report' (persistent! vs')]
-            (let [v (nth vs idx)]
-              (if (= :db.type/ref (nth types idx nil))
-                (let [[report'' v'] (resolve-tuple-slot report' v)]
-                  (recur (inc idx) report'' (conj! vs' v')))
-                (recur (inc idx) report' (conj! vs' v)))))))
-
-      (= :db.type/ref (:db/tupleType attr))
       (loop [idx     0
              report' report
              vs'     (transient [])]
         (if (>= idx (count vs))
           [report' (persistent! vs')]
-          (let [v             (nth vs idx)
-                [report'' v'] (resolve-tuple-slot report' v)]
-            (recur (inc idx) report'' (conj! vs' v')))))
+          (let [v (nth vs idx)]
+            (if (tuple-ref-slot? db schema-a idx)
+              (let [[report'' v'] (cond
+                                    (resolved-eid? v)
+                                    [report' v]
 
-      :else
-      [report vs])))
+                                    (tx-id? v)
+                                    (let [id (current-tx report')]
+                                      [(allocate-eid report' v id) id])
+
+                                    (tempid? v)
+                                    (if-some [resolved (get (:tempids report') v)]
+                                      [(update report' ::value-tempids assoc resolved v) resolved]
+                                      (let [resolved (next-eid db)]
+                                        [(-> report'
+                                             (allocate-eid v resolved)
+                                             (update ::value-tempids assoc resolved v))
+                                         resolved]))
+
+                                    :else ;; lookup ref or ident
+                                    [report' (entid-strict db v)])]
+
+                (recur (inc idx) report'' (conj! vs' v')))
+              (recur (inc idx) report' (conj! vs' v)))))))))
 
 ;; In context of `with-datom` we can use faster comparators which
 ;; do not check for nil (~10-15% performance gain in `transact`)

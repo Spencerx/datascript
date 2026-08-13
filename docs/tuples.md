@@ -152,7 +152,18 @@ Slot types other than `:db.type/ref` are not enforced — DataScript is dynamica
   [[:db/add 2 :ref+long [[:name "Ivan"] 8]]]) ; lookup ref works too
 ```
 
-Refs inside tuples are resolved on write, but are not full-fledged references otherwise: they don’t show up in reverse index, don’t get retracted when the referenced entity is retracted (the eid stays in the tuple, dangling), can’t be `:db/isComponent`, and entity API returns them as plain numbers, not entities. Same is true in Datomic.
+Ref slots are resolved on read, too: lookup refs and idents can be used anywhere a tuple value is expected, and are resolved against the current db.
+
+```
+(d/datoms db :avet :ref+long [[:name "Ivan"] 8])
+(d/index-range db :ref+long [[:name "Ivan"] 0] [[:name "Ivan"] 100])
+(d/q '[:find ?e :where [?e :ref+long [[:name "Ivan"] 8]]] db)
+(d/q '[:find ?e :in $ [?t ...] :where [?e :ref+long ?t]] db [[[:name "Ivan"] 8]])
+```
+
+This works for composite tuples with ref attributes as well. A lookup ref that resolves to nothing raises, same as it does for plain `:db.type/ref` attributes.
+
+Refs inside tuples are not full-fledged references otherwise: they don’t show up in reverse index, don’t get retracted when the referenced entity is retracted (the eid stays in the tuple, dangling), can’t be `:db/isComponent`, and entity API returns them as plain numbers, not entities. Same is true in Datomic.
 
 Unlike composite tuples, heterogeneous and homogeneous tuples are not indexed by default. Add `:db/index true` or `:db/unique` if you want AVET access. Unique declared tuples work in upserts and lookup refs, same as composite ones:
 

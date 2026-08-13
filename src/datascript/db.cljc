@@ -872,16 +872,17 @@
 ;; ----------------------------------------------------------------------------
 
 (defn attr->properties [k v]
-  (case v
-    :db.unique/identity  [:db/unique :db.unique/identity :db/index]
-    :db.unique/value     [:db/unique :db.unique/value :db/index]
-    :db.cardinality/many [:db.cardinality/many]
-    :db.type/ref         [:db.type/ref :db/index]
-    (cond
-      (and (= :db/isComponent k) (true? v)) [:db/isComponent]
-      (and (= :db/index k) (true? v))       [:db/index]
-      (= :db/tupleAttrs k)                  [:db.type/tuple :db/index]
-      :else [])))
+  (cond
+    (= :db/tupleAttrs k)                  [:db.type/tuple :db/index :db/tupleAttrs]
+    (= :db/tupleTypes k)                  [:db.type/tuple :db/tupleTypes]
+    (= :db/tupleType k)                   [:db.type/tuple :db/tupleType]
+    (= :db.unique/identity v)             [:db/unique :db.unique/identity :db/index]
+    (= :db.unique/value v)                [:db/unique :db.unique/value :db/index]
+    (= :db.cardinality/many v)            [:db.cardinality/many]
+    (= :db.type/ref v)                    [:db.type/ref :db/index]
+    (and (= :db/isComponent k) (true? v)) [:db/isComponent]
+    (and (= :db/index k) (true? v))       [:db/index]
+    :else                                 []))
 
 (defn attr-tuples
   "e.g. :reg/semester => #{:reg/semester+course+student ...}"
@@ -894,7 +895,7 @@
         m
         (-> schema (get tuple-attr) :db/tupleAttrs)))
     {}
-    (:db.type/tuple rschema)))
+    (:db/tupleAttrs rschema)))
 
 (defn- rschema
   ":db/unique           => #{attr ...}
@@ -905,6 +906,9 @@
    :db.type/ref         => #{attr ...}
    :db/isComponent      => #{attr ...}
    :db.type/tuple       => #{attr ...}
+   :db/tupleAttrs       => #{attr ...}
+   :db/tupleTypes       => #{attr ...}
+   :db/tupleType        => #{attr ...}
    :db/attrTuples       => {attr => {tuple-attr => idx}}"
   [schema]
   (let [rschema (reduce-kv
@@ -944,13 +948,21 @@
     (validate-schema-key a :db/valueType (:db/valueType kv) #{:db.type/ref :db.type/tuple})
     (validate-schema-key a :db/cardinality (:db/cardinality kv) #{:db.cardinality/one :db.cardinality/many})
 
-    ;; tuple should have tupleAttrs
-    (when (and (= :db.type/tuple (:db/valueType kv))
-            (not (contains? kv :db/tupleAttrs)))
-      (util/raise "Bad attribute specification for " a ": {:db/valueType :db.type/tuple} should also have :db/tupleAttrs"
-        {:error :schema/validation
-         :attribute a
-         :key :db/valueType}))
+    ;; tuple should have exactly one of tupleAttrs | tupleTypes | tupleType
+    (let [tuple-props (filterv #(contains? kv %) [:db/tupleAttrs :db/tupleTypes :db/tupleType])]
+      (when (and
+              (= :db.type/tuple (:db/valueType kv))
+              (empty? tuple-props))
+        (util/raise "Bad attribute specification for " a ": {:db/valueType :db.type/tuple} should also have :db/tupleAttrs, :db/tupleTypes or :db/tupleType"
+          {:error :schema/validation
+           :attribute a
+           :key :db/valueType}))
+
+      (when (< 1 (count tuple-props))
+        (util/raise "Bad attribute specification for " a ": only one of :db/tupleAttrs, :db/tupleTypes, :db/tupleType is allowed, got " tuple-props
+          {:error :schema/validation
+           :attribute a
+           :key (second tuple-props)})))
 
     ;; :db/tupleAttrs is a non-empty sequential coll
     (when (contains? kv :db/tupleAttrs)
@@ -973,7 +985,27 @@
               (util/raise a " :db/tupleAttrs can’t depend on another tuple attribute: " attr ex-data))
 
             (when (= :db.cardinality/many (:db/cardinality (get schema attr)))
-              (util/raise a " :db/tupleAttrs can’t depend on :db.cardinality/many attribute: " attr ex-data))))))))
+              (util/raise a " :db/tupleAttrs can’t depend on :db.cardinality/many attribute: " attr ex-data))))))
+
+    ;; :db/tupleTypes is a sequential coll of at least 2 keywords
+    (when (contains? kv :db/tupleTypes)
+      (let [types (:db/tupleTypes kv)]
+        (when-not (and (sequential? types)
+                    (<= 2 (count types))
+                    (every? keyword? types))
+          (util/raise a " :db/tupleTypes must be a sequential collection of at least 2 keywords, got: " types
+            {:error :schema/validation
+             :attribute a
+             :key :db/tupleTypes}))))
+
+    ;; :db/tupleType is a keyword
+    (when (contains? kv :db/tupleType)
+      (let [t (:db/tupleType kv)]
+        (when-not (keyword? t)
+          (util/raise a " :db/tupleType must be a keyword, got: " t
+            {:error :schema/validation
+             :attribute a
+             :key :db/tupleType}))))))
   
 (defn ^DB empty-db [schema opts]
   {:pre [(or (nil? schema) (map? schema))]}
@@ -1190,6 +1222,9 @@
 (defn+ ^boolean tuple-source? [db attr]
   (is-attr? db attr :db/attrTuples))
 
+(defn+ ^boolean composite-tuple? [db attr]
+  (is-attr? db attr :db/tupleAttrs))
+
 (defn+ ^boolean reverse-ref? [attr]
   (cond
     (keyword? attr)
@@ -1219,13 +1254,55 @@
     (util/raise "Bad attribute type: " attr ", expected keyword or string"
       {:error :transact/syntax, :attribute attr})))
 
-(defn resolve-tuple-refs [db a vs]
-  (mapv
-    (fn [a v]
-      (if (and (ref? db a) (sequential? v)) ;; lookup-ref
-        (entid-strict db v)
-        v))
-    (-> db -schema (get a) :db/tupleAttrs) vs))
+(defn- validate-tuple
+  "Validates that a heterogeneous/homogeneous tuple attr value is a vector
+   of the declared arity. nils are checked separately in validate-val"
+  ([db a v context]
+   (validate-tuple db a (-> db -schema (get a)) v context))
+  ([_db a schema-a v context]
+   (when (some? v)
+     (when (contains? schema-a :db/tupleTypes)
+      (let [types (:db/tupleTypes schema-a)]
+         (when-not (and (vector? v) (= (count v) (count types)))
+           (util/raise "Attribute " a " expected a " (count types) "-element vector, got: " v " in " context
+             {:error :transact/syntax, :attribute a, :value v, :context context}))))
+     (when (contains? schema-a :db/tupleType)
+       (when-not (vector? v)
+         (util/raise "Attribute " a " expected a vector, got: " v " in " context
+           {:error :transact/syntax, :attribute a, :value v, :context context}))))))
+
+(defn resolve-tuple-refs [db a vs context]
+  (let [attr (-> db -schema (get a))]
+    (validate-tuple db a attr vs context)
+    (cond
+      (not (sequential? vs)) ;; e.g. nil ov in :db.fn/cas
+      vs
+
+      (:db/tupleAttrs attr)
+      (mapv
+        (fn [el-a v]
+          (if (and (ref? db el-a) (sequential? v)) ;; lookup-ref
+            (entid-strict db v)
+            v))
+        (:db/tupleAttrs attr) vs)
+
+      (:db/tupleTypes attr)
+      (mapv
+        (fn [el-type v]
+          (if (and (= :db.type/ref el-type) (sequential? v)) ;; lookup-ref
+            (entid-strict db v)
+            v))
+        (:db/tupleTypes attr) vs)
+
+      (= :db.type/ref (:db/tupleType attr))
+      (mapv (fn [v]
+              (if (sequential? v) ;; lookup-ref
+                (entid-strict db v)
+                v))
+        vs)
+
+      :else
+      vs)))
 
 (defn+ ^number entid [db eid]
   {:pre [(db? db)]}
@@ -1247,7 +1324,7 @@
           {:error :lookup-ref/unique, :entity-id eid})
         
         (tuple? db attr)
-        (let [value' (resolve-tuple-refs db attr value)]
+        (let [value' (resolve-tuple-refs db attr value eid)]
           (-> (-datoms db :avet attr value' nil nil) first :e))
         
         (nil? value)
@@ -1420,6 +1497,84 @@
      true
      (update :db-after advance-max-eid eid))))
 
+(defn- #?@(:clj  [^Boolean tuple-slot-resolved?]
+           :cljs [^boolean tuple-slot-resolved?])
+  [x]
+  (or
+    (nil? x)
+    (and (number? x) (not (neg? x)))))
+
+(defn- resolve-tuple-slot [report v]
+  (let [db (:db-after report)]
+    (cond
+      (tuple-slot-resolved? v)
+      [report v]
+
+      (tx-id? v)
+      (let [id (current-tx report)]
+        [(allocate-eid report v id) id])
+
+      (tempid? v)
+      (if-some [resolved (get (:tempids report) v)]
+        [(update report ::value-tempids assoc resolved v) resolved]
+        (let [resolved (next-eid db)]
+          [(-> report
+             (allocate-eid v resolved)
+             (update ::value-tempids assoc resolved v))
+           resolved]))
+
+      :else ;; lookup ref or ident
+      [report (entid-strict db v)])))
+
+(defn- resolve-tuple-value
+  "Resoleves refs, tempids and :db/current-tx in ref slots. Returns [report' vs']"
+  [report a vs context]
+  (let [db   (:db-after report)
+        attr (-> db -schema (get a))
+        _    (validate-tuple db a attr vs context)]
+    (cond
+      (not (vector? vs))
+      [report vs]
+
+      (:db/tupleAttrs attr)
+      (let [el-attrs (:db/tupleAttrs attr)]
+        (loop [idx     0
+               report' report
+               vs'     (transient [])]
+          (if (>= idx (count vs))
+            [report' (persistent! vs')]
+            (let [v (nth vs idx)]
+              (if (ref? db (nth el-attrs idx nil))
+                (let [[report'' v'] (resolve-tuple-slot report' v)]
+                  (recur (inc idx) report'' (conj! vs' v')))
+                (recur (inc idx) report' (conj! vs' v)))))))
+
+      (:db/tupleTypes attr)
+      (let [types (:db/tupleTypes attr)]
+        (loop [idx     0
+               report' report
+               vs'     (transient [])]
+          (if (>= idx (count vs))
+            [report' (persistent! vs')]
+            (let [v (nth vs idx)]
+              (if (= :db.type/ref (nth types idx nil))
+                (let [[report'' v'] (resolve-tuple-slot report' v)]
+                  (recur (inc idx) report'' (conj! vs' v')))
+                (recur (inc idx) report' (conj! vs' v)))))))
+
+      (= :db.type/ref (:db/tupleType attr))
+      (loop [idx     0
+             report' report
+             vs'     (transient [])]
+        (if (>= idx (count vs))
+          [report' (persistent! vs')]
+          (let [v             (nth vs idx)
+                [report'' v'] (resolve-tuple-slot report' v)]
+            (recur (inc idx) report'' (conj! vs' v')))))
+
+      :else
+      [report vs])))
+
 ;; In context of `with-datom` we can use faster comparators which
 ;; do not check for nil (~10-15% performance gain in `transact`)
 
@@ -1482,6 +1637,9 @@
   (if-some [idents (not-empty (-attrs-by db :db.unique/identity))]
     (let [resolve (fn [a v]
                     (cond
+                      (tuple? db a)
+                      (:e (first (-datoms db :avet a (resolve-tuple-refs db a v entity) nil nil)))
+
                       (not (ref? db a))
                       (:e (first (-datoms db :avet a v nil nil)))
                       
@@ -1596,6 +1754,7 @@
   (validate-val  v ent)
   (let [tx        (or tx (current-tx report))
         db        (:db-after report)
+        _         (validate-tuple db a v ent)
         e         (entid-strict db e)
         v         (if (ref? db a) (entid-strict db v) v)
         new-datom (datom e a v tx)
@@ -1687,7 +1846,7 @@
 (defn+ transact-tx-data-impl [initial-report initial-es]
   (let [initial-report' (-> initial-report
                           #_(update :db-after transient))
-        has-tuples?     (not (empty? (-attrs-by (:db-after initial-report) :db.type/tuple)))
+        has-tuples?     (not (empty? (-attrs-by (:db-after initial-report) :db/attrTuples)))
         initial-es'     (if has-tuples?
                           (interleave initial-es (repeat ::flush-tuples))
                           initial-es)]
@@ -1799,8 +1958,14 @@
             (let [[_ e a ov nv] entity
                   e      (entid-strict db e)
                   _      (validate-attr a entity)
-                  ov     (if (ref? db a) (entid-strict db ov) ov)
-                  nv     (if (ref? db a) (entid-strict db nv) nv)
+                  ov     (cond
+                           (ref? db a)   (entid-strict db ov)
+                           (tuple? db a) (resolve-tuple-refs db a ov entity)
+                           :else         ov)
+                  nv     (cond
+                           (ref? db a)   (entid-strict db nv)
+                           (tuple? db a) (resolve-tuple-refs db a nv entity)
+                           :else         nv)
                   _      (validate-val nv entity)
                   datoms (vec (-search db [e a]))]
               (if (multival? db a)
@@ -1834,9 +1999,9 @@
               (or (= op :db/add) (= op :db/retract))
               (not (::internal (meta entity)))
               (tuple? db a)
-              :let [v' (resolve-tuple-refs db a v)]
+              :let [[report' v'] (resolve-tuple-value report a v entity)]
               (not= v v'))
-            (recur report (cons [op e a v'] entities))
+            (recur report' (cons [op e a v'] entities))
 
             (tempid? e)
             (let [upserted-eid  (when (is-attr? db a :db.unique/identity)
@@ -1863,7 +2028,7 @@
             
             (and
               (not (::internal (meta entity)))
-              (tuple? db a))
+              (composite-tuple? db a))
             ;; allow transacting in tuples if they fully match already existing values
             (let [tuple-attrs (get-in db [:schema a :db/tupleAttrs])]
               (if (and
@@ -1886,6 +2051,7 @@
               (let [v (if (ref? db a) (entid-strict db v) v)]
                 (validate-attr a entity)
                 (validate-val v entity)
+                (validate-tuple db a v entity)
                 (if-some [old-datom (fsearch db [e a v])]
                   (recur (transact-retract-datom report old-datom) entities)
                   (recur report entities)))

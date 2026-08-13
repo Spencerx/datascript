@@ -40,7 +40,7 @@
     (is (thrown-msg? ":t1 :db/tupleAttrs can’t depend on :db.cardinality/many attribute: :a"
           (d/empty-db {:a  {:db/cardinality :db.cardinality/many}
                        :t1 {:db/tupleAttrs [:a :b :c]}}))))
-  (is (thrown-msg? "Bad attribute specification for :foo+bar: {:db/valueType :db.type/tuple} should also have :db/tupleAttrs"
+  (is (thrown-msg? "Bad attribute specification for :foo+bar: {:db/valueType :db.type/tuple} should also have :db/tupleAttrs, :db/tupleTypes or :db/tupleType"
         (d/empty-db {:foo+bar {:db/valueType :db.type/tuple}}))))
 
 (deftest test-tx
@@ -117,6 +117,8 @@
             (d/transact! conn [{:db/id 2 :a+b ["a" "b"] :a "x" :b "y"}])))
       (is (thrown-msg? "Can’t modify tuple attrs directly: [:db/add 2 :a+b [\"a\"]]"
             (d/transact! conn [{:db/id 2 :a "a" :b "b" :a+b ["a"]}])))
+      (is (thrown-msg? "Can’t modify tuple attrs directly: [:db/add 2 :a+b [\"a\" \"b\" \"c\"]]"
+            (d/transact! conn [{:db/id 2 :a "a" :b "b" :a+b ["a" "b" "c"]}])))
       (is (thrown-msg? "Can’t modify tuple attrs directly: [:db/add 2 :a+b [\"a\" nil]]"
             (d/transact! conn [{:db/id 2 :a "a" :b "b" :a+b ["a" nil]}]))))
 
@@ -383,3 +385,258 @@
           (d/q '[:find ?a ?b
                  :where [?e :a+b ?a+b]
                  [(untuple ?a+b) [?a ?b]]] db)))))
+
+;; issue-364
+
+(deftest test-declared-schema
+  (let [db (d/empty-db
+             {:t1 {:db/tupleAttrs [:a :b]}
+              :t2 {:db/valueType :db.type/tuple
+                   :db/tupleTypes [:db.type/long :db.type/string]}
+              :t3 {:db/valueType :db.type/tuple
+                   :db/tupleType :db.type/keyword}})]
+    (is (= #{:t1 :t2 :t3} (:db.type/tuple (:rschema db))))
+    (is (= #{:t1} (:db/tupleAttrs (:rschema db))))
+    (is (= #{:t2} (:db/tupleTypes (:rschema db))))
+    (is (= #{:t3} (:db/tupleType (:rschema db))))
+    (is (= {:a {:t1 0} :b {:t1 1}} (:db/attrTuples (:rschema db)))))
+
+  (is (thrown-msg? ":t :db/tupleTypes must be a sequential collection of at least 2 keywords, got: :db.type/long"
+        (d/empty-db {:t {:db/tupleTypes :db.type/long}})))
+
+  (is (thrown-msg? ":t :db/tupleTypes must be a sequential collection of at least 2 keywords, got: [:db.type/long]"
+        (d/empty-db {:t {:db/tupleTypes [:db.type/long]}})))
+
+  (is (thrown-msg? ":t :db/tupleTypes must be a sequential collection of at least 2 keywords, got: [:db.type/long \"long\"]"
+        (d/empty-db {:t {:db/tupleTypes [:db.type/long "long"]}})))
+
+  (is (thrown-msg? ":t :db/tupleType must be a keyword, got: [:db.type/long]"
+        (d/empty-db {:t {:db/tupleType [:db.type/long]}})))
+
+  (is (thrown-msg? "Bad attribute specification for :t: only one of :db/tupleAttrs, :db/tupleTypes, :db/tupleType is allowed, got [:db/tupleAttrs :db/tupleTypes]"
+        (d/empty-db {:t {:db/tupleAttrs [:a :b]
+                         :db/tupleTypes [:db.type/long :db.type/long]}})))
+
+  (is (thrown-msg? "Bad attribute specification for :t: only one of :db/tupleAttrs, :db/tupleTypes, :db/tupleType is allowed, got [:db/tupleTypes :db/tupleType]"
+        (d/empty-db {:t {:db/tupleTypes [:db.type/long :db.type/long]
+                         :db/tupleType :db.type/long}}))))
+
+(deftest test-declared-tx
+  (let [conn (d/create-conn {:loc {:db/valueType :db.type/tuple
+                                   :db/tupleTypes [:db.type/long :db.type/long]}})]
+    (d/transact! conn [[:db/add 1 :loc [100 0]]])
+    (is (= #{[1 :loc [100 0]]} (tdc/all-datoms (d/db conn))))
+
+    (d/transact! conn [{:db/id 1 :loc [100 200]}])
+    (is (= #{[1 :loc [100 200]]} (tdc/all-datoms (d/db conn))))
+    (is (= {:db/id 1 :loc [100 200]} (d/pull (d/db conn) '[*] 1)))
+    (is (= [100 200] (:loc (d/entity (d/db conn) 1))))
+
+    (d/transact! conn [{:db/id 1 :loc [100 nil]}])
+    (is (= #{[1 :loc [100 nil]]} (tdc/all-datoms (d/db conn))))
+
+    (d/transact! conn [[:db/retract 1 :loc [100 nil]]])
+    (is (= #{} (tdc/all-datoms (d/db conn))))
+
+    (is (thrown-msg? "Attribute :loc expected a 2-element vector, got: [1 2 3] in [:db/add 1 :loc [1 2 3]]"
+          (d/transact! conn [[:db/add 1 :loc [1 2 3]]])))
+
+    (is (thrown-msg? "Attribute :loc expected a 2-element vector, got: \"blah\" in [:db/add 1 :loc \"blah\"]"
+          (d/transact! conn [[:db/add 1 :loc "blah"]])))
+
+    (is (thrown-msg? "Attribute :loc expected a 2-element vector, got: [1 2 3] in [:db/retract 1 :loc [1 2 3]]"
+          (d/transact! conn [[:db/retract 1 :loc [1 2 3]]])))))
+
+(deftest test-declared-refs
+  (let [schema {:name     {:db/unique :db.unique/identity}
+                :ref+long {:db/valueType :db.type/tuple
+                           :db/tupleTypes [:db.type/ref :db.type/long]}}
+        db     (-> (d/empty-db schema)
+                 (d/db-with [{:db/id 1 :name "Ivan"}
+                             {:db/id 2 :name "Oleg"}]))]
+    (testing "eid in ref slot"
+      (is (= #{[1 :name "Ivan"] [2 :name "Oleg"] [2 :ref+long [1 7]]}
+            (tdc/all-datoms (d/db-with db [[:db/add 2 :ref+long [1 7]]])))))
+
+    (testing "lookup ref in ref slot"
+      (is (= #{[1 :name "Ivan"] [2 :name "Oleg"] [2 :ref+long [1 7]]}
+            (tdc/all-datoms (d/db-with db [[:db/add 2 :ref+long [[:name "Ivan"] 7]]]))))
+      (is (= #{[1 :name "Ivan"] [2 :name "Oleg"] [2 :ref+long [1 7]]}
+            (tdc/all-datoms (d/db-with db [{:db/id 2 :ref+long [[:name "Ivan"] 7]}])))))
+
+    (testing "tempid in ref slot resolves to same entity"
+      (let [report (d/with db [{:db/id -1 :name "Petr"}
+                               [:db/add 2 :ref+long [-1 7]]])
+            petr   (get (:tempids report) -1)]
+        (is (= #{[1 :name "Ivan"] [2 :name "Oleg"]
+                 [petr :name "Petr"] [2 :ref+long [petr 7]]}
+              (tdc/all-datoms (:db-after report))))))
+
+    (testing "tempid used only in ref slot"
+      (is (thrown-msg? "Tempids used only as value in transaction: (-5)"
+            (d/db-with db [[:db/add 2 :ref+long [-5 7]]]))))
+
+    (testing "extra elements are not silently truncated during ref resolution"
+      (is (thrown-msg? "Attribute :ref+long expected a 2-element vector, got: [[:name \"Ivan\"] 7 8] in [:db/add 2 :ref+long [[:name \"Ivan\"] 7 8]]"
+            (d/db-with db [[:db/add 2 :ref+long [[:name "Ivan"] 7 8]]]))))
+
+    (testing ":db/current-tx in ref slot"
+      (let [db' (:db-after (d/with db [[:db/add 2 :ref+long [:db/current-tx 7]]]))
+            tx  (:max-tx db')]
+        (is (= #{[1 :name "Ivan"] [2 :name "Oleg"] [2 :ref+long [tx 7]]}
+              (tdc/all-datoms db')))))
+
+    (testing "retract by value with lookup ref in ref slot"
+      (let [db' (d/db-with db [[:db/add 2 :ref+long [1 7]]])]
+        (is (= #{[1 :name "Ivan"] [2 :name "Oleg"]}
+              (tdc/all-datoms (d/db-with db' [[:db/retract 2 :ref+long [[:name "Ivan"] 7]]]))))))
+
+    (testing "non-ref slots are not resolved"
+      (let [db' (d/db-with (d/empty-db {:long+ref {:db/valueType :db.type/tuple
+                                                   :db/tupleTypes [:db.type/long :db.type/ref]}
+                                        :name     {:db/unique :db.unique/identity}})
+                  [{:db/id 1 :name "Ivan"}
+                   [:db/add 1 :long+ref [7 [:name "Ivan"]]]])]
+        (is (= #{[1 :name "Ivan"] [1 :long+ref [7 1]]}
+              (tdc/all-datoms db')))))))
+
+(deftest test-homogeneous
+  (let [conn (d/create-conn {:kws {:db/valueType :db.type/tuple
+                                   :db/tupleType :db.type/keyword}})]
+    (d/transact! conn [[:db/add 1 :kws [:a :b]]])
+    (is (= #{[1 :kws [:a :b]]} (tdc/all-datoms (d/db conn))))
+
+    (d/transact! conn [[:db/add 1 :kws [:a :b :c]]])
+    (is (= #{[1 :kws [:a :b :c]]} (tdc/all-datoms (d/db conn))))
+
+    (is (thrown-msg? "Attribute :kws expected a vector, got: :a in [:db/add 1 :kws :a]"
+          (d/transact! conn [[:db/add 1 :kws :a]]))))
+
+  (testing "homogeneous ref tuple resolves every slot"
+    (let [db (-> (d/empty-db {:name {:db/unique :db.unique/identity}
+                              :refs {:db/valueType :db.type/tuple
+                                     :db/tupleType :db.type/ref}})
+               (d/db-with [{:db/id 1 :name "Ivan"}
+                           {:db/id 2 :name "Oleg"}]))]
+      (is (= #{[1 :name "Ivan"] [2 :name "Oleg"] [1 :refs [1 2]]}
+            (tdc/all-datoms (d/db-with db [[:db/add 1 :refs [[:name "Ivan"] [:name "Oleg"]]]])))))))
+
+(deftest test-declared-unique-upsert
+  (let [conn (d/create-conn {:name     {:db/unique :db.unique/identity}
+                             :ref+long {:db/valueType :db.type/tuple
+                                        :db/tupleTypes [:db.type/ref :db.type/long]
+                                        :db/unique :db.unique/identity}})]
+    (d/transact! conn [{:db/id 1 :name "Ivan"}
+                       {:db/id 2 :name "Oleg" :ref+long [1 7]}])
+
+    (testing "upsert by map form"
+      (d/transact! conn [{:ref+long [1 7] :age 30}])
+      (is (= {:db/id 2 :name "Oleg" :ref+long [1 7] :age 30}
+            (d/pull (d/db conn) '[*] 2))))
+
+    (testing "upsert by map form with lookup ref in ref slot"
+      (d/transact! conn [{:ref+long [[:name "Ivan"] 7] :age 31}])
+      (is (= {:db/id 2 :name "Oleg" :ref+long [1 7] :age 31}
+            (d/pull (d/db conn) '[*] 2))))
+
+    (testing "upsert by vector op with tempid"
+      (let [report (d/with (d/db conn) [[:db/add -1 :ref+long [[:name "Ivan"] 7]]
+                                        [:db/add -1 :age 32]])]
+        (is (= 2 (get (:tempids report) -1)))
+        (is (= 32 (:age (d/entity (:db-after report) 2))))))
+
+    (testing "unique constraint"
+      (is (thrown-with-msg? ExceptionInfo #"Cannot add .* because of unique constraint: .*"
+            (d/transact! conn [[:db/add 3 :ref+long [1 7]]]))))
+
+    (testing "conflicting upsert"
+      (d/transact! conn [{:db/id 3 :name "Petr" :ref+long [1 8]}])
+      (is (thrown-msg? "Conflicting upserts: [:name \"Oleg\"] resolves to 2, but [:ref+long [1 8]] resolves to 3"
+            (d/transact! conn [{:name "Oleg" :ref+long [1 8]}]))))))
+
+(deftest test-declared-lookup-refs
+  (let [db (-> (d/empty-db {:name {:db/unique :db.unique/identity}
+                            :ref+long {:db/valueType :db.type/tuple
+                                       :db/tupleTypes [:db.type/ref :db.type/long]
+                                       :db/unique :db.unique/identity}})
+             (d/db-with [{:db/id 1 :name "Ivan"}
+                         {:db/id 2 :name "Oleg" :ref+long [1 7]}]))]
+    (is (= 2 (:db/id (d/entity db [:ref+long [1 7]]))))
+    (is (= 2 (:db/id (d/entity db [:ref+long [[:name "Ivan"] 7]]))))
+
+    (is (= {:name "Oleg"} (d/pull db [:name] [:ref+long [[:name "Ivan"] 7]])))
+
+    (is (= #{[1 :name "Ivan"] [2 :name "Oleg"] [2 :ref+long [1 7]] [2 :age 30]}
+          (tdc/all-datoms (d/db-with db [[:db/add [:ref+long [[:name "Ivan"] 7]] :age 30]]))))
+
+    (is (= #{[1 :name "Ivan"] [2 :name "Oleg"] [2 :ref+long [1 7]] [2 :age 30]}
+          (tdc/all-datoms (d/db-with db [{:db/id [:ref+long [1 7]] :age 30}]))))))
+
+(deftest test-declared-index
+  (let [schema {:loc {:db/valueType :db.type/tuple
+                      :db/tupleTypes [:db.type/long :db.type/long]}}
+        tx     [[:db/add 1 :loc [100 0]]
+                [:db/add 2 :loc [100 200]]
+                [:db/add 3 :loc [200 0]]]]
+    (testing "not indexed by default"
+      (let [db (d/db-with (d/empty-db schema) tx)]
+        (is (thrown-msg? "Attribute :loc should be marked as :db/index true"
+              (vec (d/datoms db :avet :loc))))))
+
+    (testing "indexed with :db/index true"
+      (let [db (d/db-with (d/empty-db (update schema :loc assoc :db/index true)) tx)]
+        (is (= [1 2 3] (mapv :e (d/datoms db :avet :loc))))
+        (is (= [[100 0]] (mapv :v (d/datoms db :avet :loc [100 0]))))
+        (is (= [1 2] (mapv :e (d/index-range db :loc [100 0] [100 200]))))))))
+
+(deftest test-declared-cas
+  (let [conn (d/create-conn {:name {:db/unique :db.unique/identity}
+                             :ref+long {:db/valueType :db.type/tuple
+                                        :db/tupleTypes [:db.type/ref :db.type/long]}})]
+    (d/transact! conn [{:db/id 1 :name "Ivan"}
+                       [:db/add 2 :ref+long [1 7]]])
+
+    (d/transact! conn [[:db.fn/cas 2 :ref+long [[:name "Ivan"] 7] [[:name "Ivan"] 8]]])
+    (is (= [1 8] (:ref+long (d/entity (d/db conn) 2))))
+
+    (is (thrown-with-msg? ExceptionInfo #":db.fn/cas failed on datom .*"
+          (d/transact! conn [[:db.fn/cas 2 :ref+long [1 7] [1 9]]])))
+
+    (testing "set-if-absent with nil ov"
+      (d/transact! conn [[:db.fn/cas 3 :ref+long nil [[:name "Ivan"] 5]]])
+      (is (= [1 5] (:ref+long (d/entity (d/db conn) 3)))))
+
+    (testing "arity validated in cas values"
+      (is (thrown-msg? "Attribute :ref+long expected a 2-element vector, got: [1 8 9] in [:db.fn/cas 2 :ref+long [1 8 9] [1 9]]"
+            (d/transact! conn [[:db.fn/cas 2 :ref+long [1 8 9] [1 9]]]))))))
+
+(deftest test-declared-many
+  (let [conn (d/create-conn {:locs {:db/valueType :db.type/tuple
+                                    :db/tupleTypes [:db.type/long :db.type/long]
+                                    :db/cardinality :db.cardinality/many}})]
+    (d/transact! conn [[:db/add 1 :locs [100 0]]
+                       [:db/add 1 :locs [200 0]]])
+    (is (= #{[1 :locs [100 0]] [1 :locs [200 0]]} (tdc/all-datoms (d/db conn))))
+
+    ;; in map form, multiple values must be wrapped: a naked tuple
+    ;; is treated as a collection of values
+    (d/transact! conn [{:db/id 2 :locs [[300 0] [400 0]]}])
+    (is (= #{[2 :locs [300 0]] [2 :locs [400 0]]}
+          (tdc/all-datoms (d/db-with (d/empty-db {:locs {:db/valueType :db.type/tuple
+                                                         :db/tupleTypes [:db.type/long :db.type/long]
+                                                         :db/cardinality :db.cardinality/many}})
+                            [{:db/id 2 :locs [[300 0] [400 0]]}]))))))
+
+(deftest test-declared-serialize
+  (let [db  (-> (d/empty-db {:name {:db/unique :db.unique/identity}
+                             :loc  {:db/valueType :db.type/tuple
+                                    :db/tupleTypes [:db.type/long :db.type/long]}
+                             :kws  {:db/valueType :db.type/tuple
+                                    :db/tupleType :db.type/keyword}
+                             :refs {:db/valueType :db.type/tuple
+                                    :db/tupleType :db.type/ref}})
+              (d/db-with [{:db/id 1 :name "Ivan" :loc [100 nil] :kws [:a :b]}
+                          {:db/id 2 :name "Oleg" :refs [1 1]}]))
+        db' (d/from-serializable (d/serializable db))]
+    (is (= (tdc/all-datoms db) (tdc/all-datoms db')))
+    (is (= (:schema db) (:schema db')))))

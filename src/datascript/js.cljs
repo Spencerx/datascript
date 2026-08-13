@@ -151,15 +151,15 @@
   (go/get tempids (str tempid)))
 
 (defn ^:export datoms [db index & components]
-  (->> (apply d/datoms db (keywordize index) components)
+  (->> (apply d/datoms db (keywordize index) (map js->clj components))
     into-array))
 
 (defn ^:export seek_datoms [db index & components]
-  (->> (apply d/seek-datoms db (keywordize index) components)
+  (->> (apply d/seek-datoms db (keywordize index) (map js->clj components))
     into-array))
 
 (defn ^:export index_range [db attr start end]
-  (into-array (d/index-range db attr start end)))
+  (into-array (d/index-range db attr (js->clj start) (js->clj end))))
 
 (defn ^:export squuid []
   (str (d/squuid)))

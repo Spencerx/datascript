@@ -58,6 +58,26 @@ function assert_eq_set(expected, got, message) {
   }
 }
 
+function assert_throws(expected_msg, fn, message) {
+  asserts++;
+  var thrown = null;
+  try {
+    fn();
+  } catch (e) {
+    thrown = (e && e.message) || String(e);
+  }
+  if (thrown == null) {
+    errors--;
+    failures++;
+    throw (message || "Assertion failed") + ": expected error " + JSON.stringify(expected_msg) + ", got no error";
+  }
+  if (thrown.indexOf(expected_msg) < 0) {
+    errors--;
+    failures++;
+    throw (message || "Assertion failed") + ": expected error " + JSON.stringify(expected_msg) + ", got: " + JSON.stringify(thrown);
+  }
+}
+
 function assert_eq_refs(expected, got, message) {
   var got_ids = _.map(got, function(e) { return e.get(":db/id"); });
   assert_eq_set(expected, got_ids);
@@ -200,6 +220,286 @@ function test_tuple() {
                           [":db/add", 1, "c", "C"]]);
   var q = '[:find ?e ?a+b+c :in $ :where [?e "a+b+c" ?a+b+c]]';
   assert_eq_set([[1, ["A", "B", "C"]]], d.q(q, db));
+}
+
+function eids(datoms) {
+  return _.map(datoms, function(d) { return d.e; });
+}
+
+var hetero_schema = {"loc": {":db/valueType": ":db.type/tuple",
+                             ":db/tupleTypes": [":db.type/long", ":db.type/long"]}};
+
+var homo_schema = {"kws": {":db/valueType": ":db.type/tuple",
+                           ":db/tupleType": ":db.type/keyword"}};
+
+var tuple_ref_schema = {"name":     {":db/unique": ":db.unique/identity"},
+                        "ref+long": {":db/valueType": ":db.type/tuple",
+                                     ":db/tupleTypes": [":db.type/ref", ":db.type/long"]}};
+
+function test_hetero_tuple() {
+  var q = '[:find ?loc . :in $ ?e :where [?e "loc" ?loc]]';
+  var conn = d.create_conn(hetero_schema);
+
+  // vector form
+  d.transact(conn, [[":db/add", 1, "loc", [100, 0]]]);
+  assert_eq([100, 0], d.q(q, d.db(conn), 1));
+
+  // map form
+  d.transact(conn, [{":db/id": 1, "loc": [100, 200]}]);
+  assert_eq([100, 200], d.q(q, d.db(conn), 1));
+
+  // pull
+  assert_eq({"loc": [100, 200]}, d.pull(d.db(conn), '["loc"]', 1));
+  assert_eq({":db/id": 1, "loc": [100, 200]}, d.pull(d.db(conn), '[*]', 1));
+
+  // null is a legal value in any slot
+  d.transact(conn, [[":db/add", 1, "loc", [100, null]]]);
+  assert_eq([100, null], d.q(q, d.db(conn), 1));
+
+  // retract by value
+  d.transact(conn, [[":db/retract", 1, "loc", [100, null]]]);
+  assert_eq(null, d.q(q, d.db(conn), 1));
+
+  // init_db
+  var db = d.init_db([[1, "loc", [100, 0]],
+                      [2, "loc", [200, 0]]],
+                     hetero_schema);
+  assert_eq_set([[1, [100, 0]], [2, [200, 0]]],
+                d.q('[:find ?e ?loc :where [?e "loc" ?loc]]', db));
+
+  // arity is validated
+  assert_throws('Attribute "loc" expected a 2-element vector, got: [1 2 3]',
+    function() { d.transact(conn, [[":db/add", 1, "loc", [1, 2, 3]]]); });
+  assert_throws('Attribute "loc" expected a 2-element vector, got: "blah"',
+    function() { d.transact(conn, [[":db/add", 1, "loc", "blah"]]); });
+  assert_throws('Attribute "loc" expected a 2-element vector, got: [1 2 3]',
+    function() { d.transact(conn, [[":db/retract", 1, "loc", [1, 2, 3]]]); });
+}
+
+function test_homo_tuple() {
+  var q = '[:find ?kws . :in $ ?e :where [?e "kws" ?kws]]';
+  var conn = d.create_conn(homo_schema);
+
+  d.transact(conn, [[":db/add", 1, "kws", [":a", ":b"]]]);
+  assert_eq([":a", ":b"], d.q(q, d.db(conn), 1));
+  assert_eq({"kws": [":a", ":b"]}, d.pull(d.db(conn), '["kws"]', 1));
+
+  // length is not fixed
+  d.transact(conn, [[":db/add", 1, "kws", [":a", ":b", ":c"]]]);
+  assert_eq([":a", ":b", ":c"], d.q(q, d.db(conn), 1));
+
+  var db = d.db_with(d.empty_db({"xs": {":db/valueType": ":db.type/tuple",
+                                        ":db/tupleType": ":db.type/long"}}),
+                     [[":db/add", 1, "xs", [1, 2, 3]],
+                      [":db/add", 2, "xs", [4]]]);
+  assert_eq_set([[1, [1, 2, 3]], [2, [4]]],
+                d.q('[:find ?e ?xs :where [?e "xs" ?xs]]', db));
+
+  // still has to be a vector
+  assert_throws('Attribute "kws" expected a vector, got: ":a"',
+    function() { d.transact(conn, [[":db/add", 1, "kws", ":a"]]); });
+}
+
+function test_tuple_schema_errors() {
+  assert_throws('"t" :db/tupleTypes must be a sequential collection of at least 2 keywords, got: [:db.type/long]',
+    function() { d.empty_db({"t": {":db/valueType": ":db.type/tuple",
+                                   ":db/tupleTypes": [":db.type/long"]}}); });
+
+  assert_throws('"t" :db/tupleType must be a keyword, got: [:db.type/long]',
+    function() { d.empty_db({"t": {":db/valueType": ":db.type/tuple",
+                                   ":db/tupleType": [":db.type/long"]}}); });
+
+  assert_throws('Bad attribute specification for "t": {:db/valueType :db.type/tuple} should also have :db/tupleAttrs, :db/tupleTypes or :db/tupleType',
+    function() { d.empty_db({"t": {":db/valueType": ":db.type/tuple"}}); });
+
+  assert_throws('Bad attribute specification for "t": only one of :db/tupleAttrs, :db/tupleTypes, :db/tupleType is allowed, got [:db/tupleAttrs :db/tupleTypes]',
+    function() { d.empty_db({"t": {":db/tupleAttrs": ["a", "b"],
+                                   ":db/tupleTypes": [":db.type/long", ":db.type/long"]}}); });
+}
+
+function test_tuple_refs() {
+  var q = '[:find ?v . :in $ ?e :where [?e "ref+long" ?v]]';
+  var db = d.db_with(d.empty_db(tuple_ref_schema),
+                     [{":db/id": 1, "name": "Ivan"},
+                      {":db/id": 2, "name": "Oleg"}]);
+
+  // entity id in ref slot
+  assert_eq([1, 7], d.q(q, d.db_with(db, [[":db/add", 2, "ref+long", [1, 7]]]), 2));
+
+  // lookup ref in ref slot
+  assert_eq([1, 7], d.q(q, d.db_with(db, [[":db/add", 2, "ref+long", [["name", "Ivan"], 7]]]), 2));
+  assert_eq([1, 7], d.q(q, d.db_with(db, [{":db/id": 2, "ref+long": [["name", "Ivan"], 7]}]), 2));
+
+  // tempid in ref slot
+  var conn = d.create_conn(tuple_ref_schema);
+  var report = d.transact(conn, [{":db/id": -1, "name": "Ivan"},
+                                 [":db/add", 2, "ref+long", [-1, 7]]]);
+  assert_eq([d.resolve_tempid(report.tempids, -1), 7], d.q(q, d.db(conn), 2));
+
+  // ":db/current-tx" in ref slot
+  conn = d.create_conn(tuple_ref_schema);
+  report = d.transact(conn, [[":db/add", 1, "ref+long", [":db/current-tx", 7]]]);
+  assert_eq([tx0+1, 7], d.q(q, d.db(conn), 1));
+
+  // retract by value with lookup ref in ref slot
+  var db1 = d.db_with(db, [[":db/add", 2, "ref+long", [1, 7]]]);
+  assert_eq(null, d.q(q, d.db_with(db1, [[":db/retract", 2, "ref+long", [["name", "Ivan"], 7]]]), 2));
+
+  // tempid that is only used inside a tuple is not enough to create an entity
+  assert_throws("Tempids used only as value in transaction: (-5)",
+    function() { d.db_with(db, [[":db/add", 2, "ref+long", [-5, 7]]]); });
+
+  // non-ref slots are left alone
+  var db2 = d.db_with(d.empty_db({"name":     {":db/unique": ":db.unique/identity"},
+                                  "long+ref": {":db/valueType": ":db.type/tuple",
+                                               ":db/tupleTypes": [":db.type/long", ":db.type/ref"]}}),
+                      [{":db/id": 1, "name": "Ivan"},
+                       [":db/add", 1, "long+ref", [7, ["name", "Ivan"]]]]);
+  assert_eq([7, 1], d.q('[:find ?v . :where [1 "long+ref" ?v]]', db2));
+
+  // homogeneous tuple of refs resolves every slot
+  var db3 = d.db_with(d.empty_db({"name": {":db/unique": ":db.unique/identity"},
+                                  "refs": {":db/valueType": ":db.type/tuple",
+                                           ":db/tupleType": ":db.type/ref"}}),
+                      [{":db/id": 1, "name": "Ivan"},
+                       {":db/id": 2, "name": "Oleg"}]);
+  db3 = d.db_with(db3, [[":db/add", 1, "refs", [["name", "Ivan"], ["name", "Oleg"]]]]);
+  assert_eq([1, 2], d.q('[:find ?v . :where [1 "refs" ?v]]', db3));
+}
+
+var unique_tuple_schema = {"name":     {":db/unique": ":db.unique/identity"},
+                           "ref+long": {":db/valueType": ":db.type/tuple",
+                                        ":db/tupleTypes": [":db.type/ref", ":db.type/long"],
+                                        ":db/unique": ":db.unique/identity"}};
+
+function test_tuple_unique() {
+  var conn = d.create_conn(unique_tuple_schema);
+  d.transact(conn, [{":db/id": 1, "name": "Ivan"},
+                    {":db/id": 2, "name": "Oleg", "ref+long": [1, 7]}]);
+
+  // upsert by tuple
+  d.transact(conn, [{"ref+long": [1, 7], "age": 30}]);
+  assert_eq({":db/id": 2, "name": "Oleg", "ref+long": [1, 7], "age": 30},
+            d.pull(d.db(conn), '[*]', 2));
+
+  // upsert by tuple with lookup ref inside
+  d.transact(conn, [{"ref+long": [["name", "Ivan"], 7], "age": 31}]);
+  assert_eq(31, d.q('[:find ?age . :where [2 "age" ?age]]', d.db(conn)));
+
+  // tuple as a lookup ref
+  assert_eq("Oleg", d.entity(d.db(conn), ["ref+long", [1, 7]]).get("name"));
+  assert_eq("Oleg", d.entity(d.db(conn), ["ref+long", [["name", "Ivan"], 7]]).get("name"));
+  assert_eq({"name": "Oleg"}, d.pull(d.db(conn), '["name"]', ["ref+long", [1, 7]]));
+  assert_eq_set([{"name": "Oleg"}], d.pull_many(d.db(conn), '["name"]', [["ref+long", [1, 7]]]));
+  assert_eq([2], eids(d.datoms(d.db(conn), ":eavt", ["ref+long", [1, 7]], "name")));
+
+  d.transact(conn, [[":db/add", ["ref+long", [["name", "Ivan"], 7]], "age", 32]]);
+  assert_eq(32, d.q('[:find ?age . :where [2 "age" ?age]]', d.db(conn)));
+
+  // uniqueness is enforced
+  assert_throws('Cannot add #datascript/Datom [3 "ref+long" [1 7]',
+    function() { d.transact(conn, [[":db/add", 3, "ref+long", [1, 7]]]); });
+
+  // conflicting upserts
+  d.transact(conn, [{":db/id": 3, "name": "Petr", "ref+long": [1, 8]}]);
+  assert_throws('Conflicting upserts: ["name" "Oleg"] resolves to 2, but ["ref+long" [1 8]] resolves to 3',
+    function() { d.transact(conn, [{"name": "Oleg", "ref+long": [1, 8]}]); });
+}
+
+function test_tuple_index() {
+  var tx = [[":db/add", 1, "loc", [100, 0]],
+            [":db/add", 2, "loc", [100, 200]],
+            [":db/add", 3, "loc", [200, 0]]];
+
+  // not indexed by default
+  var db = d.db_with(d.empty_db(hetero_schema), tx);
+  assert_throws('Attribute "loc" should be marked as :db/index true',
+    function() { d.datoms(db, ":avet", "loc"); });
+
+  var indexed_schema = {"loc": {":db/valueType": ":db.type/tuple",
+                                ":db/tupleTypes": [":db.type/long", ":db.type/long"],
+                                ":db/index": true}};
+  db = d.db_with(d.empty_db(indexed_schema), tx);
+  assert_eq([1, 2, 3], eids(d.datoms(db, ":avet", "loc")));
+  assert_eq([1],       eids(d.datoms(db, ":avet", "loc", [100, 0])));
+  assert_eq([2, 3],    eids(d.seek_datoms(db, ":avet", "loc", [100, 200])));
+  assert_eq([1, 2],    eids(d.index_range(db, "loc", [100, 0], [100, 200])));
+  assert_eq([1],       eids(d.datoms(db, ":eavt", 1, "loc", [100, 0])));
+
+  // homogeneous tuples sort by length first
+  db = d.db_with(d.empty_db({"xs": {":db/valueType": ":db.type/tuple",
+                                    ":db/tupleType": ":db.type/long",
+                                    ":db/index": true}}),
+                 [[":db/add", 1, "xs", [1, 3]],
+                  [":db/add", 2, "xs", [1, 2, 3]],
+                  [":db/add", 3, "xs", [1, 2]]]);
+  assert_eq([3, 1, 2], eids(d.datoms(db, ":avet", "xs")));
+}
+
+function test_tuple_many() {
+  var schema = {"locs": {":db/valueType": ":db.type/tuple",
+                         ":db/tupleTypes": [":db.type/long", ":db.type/long"],
+                         ":db/cardinality": ":db.cardinality/many"}};
+  var q = '[:find ?e ?locs :where [?e "locs" ?locs]]';
+
+  var db = d.db_with(d.empty_db(schema), [[":db/add", 1, "locs", [100, 0]],
+                                          [":db/add", 1, "locs", [200, 0]]]);
+  assert_eq_set([[1, [100, 0]], [1, [200, 0]]], d.q(q, db));
+
+  // in map form, several tuples have to be wrapped in an extra array,
+  // otherwise a single tuple is read as a collection of values
+  db = d.db_with(d.empty_db(schema), [{":db/id": 1, "locs": [[300, 0], [400, 0]]}]);
+  assert_eq_set([[1, [300, 0]], [1, [400, 0]]], d.q(q, db));
+
+  db = d.db_with(db, [[":db/retract", 1, "locs", [300, 0]]]);
+  assert_eq_set([[1, [400, 0]]], d.q(q, db));
+}
+
+function test_tuple_cas() {
+  var q = '[:find ?v . :in $ ?e :where [?e "ref+long" ?v]]';
+  var conn = d.create_conn(tuple_ref_schema);
+  d.transact(conn, [{":db/id": 1, "name": "Ivan"},
+                    [":db/add", 2, "ref+long", [1, 7]]]);
+
+  d.transact(conn, [[":db.fn/cas", 2, "ref+long", [["name", "Ivan"], 7], [["name", "Ivan"], 8]]]);
+  assert_eq([1, 8], d.q(q, d.db(conn), 2));
+
+  assert_throws(':db.fn/cas failed on datom [2 "ref+long" [1 8]], expected [1 7]',
+    function() { d.transact(conn, [[":db.fn/cas", 2, "ref+long", [1, 7], [1, 9]]]); });
+
+  // set-if-absent
+  d.transact(conn, [[":db.fn/cas", 3, "ref+long", null, [["name", "Ivan"], 5]]]);
+  assert_eq([1, 5], d.q(q, d.db(conn), 3));
+
+  assert_throws('Attribute "ref+long" expected a 2-element vector, got: [1 8 9]',
+    function() { d.transact(conn, [[":db.fn/cas", 2, "ref+long", [1, 8, 9], [1, 9]]]); });
+}
+
+function test_tuple_serialize() {
+  var schema = {"name": {":db/unique": ":db.unique/identity"},
+                "loc":  {":db/valueType": ":db.type/tuple",
+                         ":db/tupleTypes": [":db.type/long", ":db.type/long"]},
+                "kws":  {":db/valueType": ":db.type/tuple",
+                         ":db/tupleType": ":db.type/keyword"},
+                "refs": {":db/valueType": ":db.type/tuple",
+                         ":db/tupleType": ":db.type/ref"}};
+  var db = d.db_with(d.empty_db(schema),
+                     [{":db/id": 1, "name": "Ivan", "loc": [100, null], "kws": [":a", ":b"]},
+                      {":db/id": 2, "name": "Oleg", "refs": [1, 1]}]);
+  var db2 = d.from_serializable(JSON.parse(JSON.stringify(d.serializable(db))));
+
+  var q = '[:find ?e ?a ?v :where [?e ?a ?v]]';
+  var expected = [[1, "name", "Ivan"],
+                  [1, "loc",  [100, null]],
+                  [1, "kws",  [":a", ":b"]],
+                  [2, "name", "Oleg"],
+                  [2, "refs", [1, 1]]];
+  assert_eq_set(expected, d.q(q, db));
+  assert_eq_set(expected, d.q(q, db2));
+
+  // schema survives, tuples are still validated after a round-trip
+  assert_throws('Attribute "loc" expected a 2-element vector, got: [1 2 3]',
+    function() { d.db_with(db2, [[":db/add", 1, "loc", [1, 2, 3]]]); });
 }
 
 function test_tx_report() {
@@ -561,6 +861,15 @@ function test_datascript_js() {
                     test_dbfn_call,
                     test_schema,
                     test_tuple,
+                    test_hetero_tuple,
+                    test_homo_tuple,
+                    test_tuple_schema_errors,
+                    test_tuple_refs,
+                    test_tuple_unique,
+                    test_tuple_index,
+                    test_tuple_many,
+                    test_tuple_cas,
+                    test_tuple_serialize,
                     test_tx_report,
                     test_conn,
                     test_entity,

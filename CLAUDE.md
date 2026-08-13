@@ -10,6 +10,8 @@ DataScript is an immutable in-memory database and Datalog query engine implement
 
 ### Testing
 
+Prefer Clojure JVM tests for correctness (much faster), check cljs and js only after test_clj.sh passes.
+
 ```bash
 # Run Clojure tests
 ./script/test_clj.sh

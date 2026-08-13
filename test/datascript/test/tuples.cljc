@@ -243,8 +243,27 @@
           (tdc/all-datoms
             (d/db-with db'
               [[:db/add -1 :a "A"]
-               [:db/add -1 :b "B"] 
+               [:db/add -1 :b "B"]
                [:db/add -1 :name "Oleg"]]))))))
+
+;; issue-378
+(deftest test-upsert-by-tuple-with-tempids
+  (let [db (-> (d/empty-db {:player  {:db/unique :db.unique/identity}
+                            :home    {:db/valueType :db.type/ref}
+                            :away    {:db/valueType :db.type/ref}
+                            :players {:db/unique :db.unique/identity
+                                      :db/tupleAttrs [:home :away]}})
+             (d/db-with [[:db/add -1 :player "Nadal"]
+                         [:db/add -2 :player "Federer"]
+                         {:home -1
+                          :away -2}]))
+        db' (d/db-with db [{:db/id "p1" :player "Nadal"}
+                           {:db/id "p2" :player "Federer"}
+                           {:db/id "match"
+                            :players ["p1" "p2"]
+                            :game 3}])]
+    (is (= 3 (:game (d/entity db' 3))))
+    (is (= [1 2] (:players (d/entity db' 3))))))
 
 (deftest test-lookup-refs
   (let [conn (d/create-conn {:a+b {:db/tupleAttrs [:a :b]
@@ -544,6 +563,18 @@
                                         [:db/add -1 :age 32]])]
         (is (= 2 (get (:tempids report) -1)))
         (is (= 32 (:age (d/entity (:db-after report) 2))))))
+
+    (testing "upsert by map form with tempid in ref slot"
+      (let [report (d/with (d/db conn) [{:db/id -1 :name "Ivan"}
+                                        {:ref+long [-1 7] :age 33}])]
+        (is (= 1 (get (:tempids report) -1)))
+        (is (= 33 (:age (d/entity (:db-after report) 2))))))
+
+    (testing "map form with tempid in ref slot, no existing match"
+      (let [report  (d/with (d/db conn) [{:db/id -1 :name "Anna"}
+                                         {:ref+long [-1 9] :age 21}])
+            anna-id (get (:tempids report) -1)]
+        (is (= 21 (:age (d/entity (:db-after report) [:ref+long [anna-id 9]]))))))
 
     (testing "unique constraint"
       (is (thrown-with-msg? ExceptionInfo #"Cannot add .* because of unique constraint: .*"

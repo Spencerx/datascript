@@ -1598,6 +1598,25 @@
         (update report' ::queued-tuples assoc e queue'))
       report')))
 
+(defn- #?@(:clj  [^Boolean tuple-has-tempids?]
+           :cljs [^boolean tuple-has-tempids?])
+  [db a vs]
+  (and
+    (sequential? vs)
+    (let [schema-a (-> db -schema (get a))]
+      (loop [idx 0]
+        (cond
+          (>= idx (count vs))
+          false
+
+          (and
+            (tuple-ref-slot? db schema-a idx)
+            (tempid? (nth vs idx)))
+          true
+
+          :else
+          (recur (inc idx)))))))
+
 (defn- resolve-upserts
   "Returns [entity' upserts]. Upsert attributes that resolve to existing entities
    are removed from entity, rest are kept in entity for insertion. No validation is performed.
@@ -1610,6 +1629,9 @@
   (if-some [idents (not-empty (-attrs-by db :db.unique/identity))]
     (let [resolve (fn [a v]
                     (cond
+                      (and (tuple? db a) (tuple-has-tempids? db a v))
+                      nil
+
                       (tuple? db a)
                       (:e (first (-datoms db :avet a (resolve-tuple-refs db a v entity) nil nil)))
 

@@ -1,6 +1,7 @@
 # WIP
 
 - Support heterogeneous (`:db/tupleTypes`) and homogeneous (`:db/tupleType`) tuples #364 #427
+- Fixed upserting by unique tuple with tempids in ref slots #378
 
 # 1.7.8 - Oct 11, 2025
 

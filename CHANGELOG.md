@@ -1,3 +1,7 @@
+# 1.8.1 - Aug 15, 2026
+
+- Re-enable transient indices during transact #373
+
 # 1.8.0 - Aug 13, 2026
 
 - Support heterogeneous (`:db/tupleTypes`) and homogeneous (`:db/tupleType`) tuples #364 #427

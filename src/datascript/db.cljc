@@ -1840,7 +1840,7 @@
 
 (defn+ transact-tx-data-impl [initial-report initial-es]
   (let [initial-report' (-> initial-report
-                          #_(update :db-after transient))
+                          (update :db-after transient))
         has-tuples?     (not (empty? (-attrs-by (:db-after initial-report) :db/attrTuples)))
         initial-es'     (if has-tuples?
                           (interleave initial-es (repeat ::flush-tuples))
@@ -1857,7 +1857,7 @@
           (update :tempids #(util/removem auto-tempid? %))
           (update :tempids assoc :db/current-tx (current-tx report))
           (update :db-after update :max-tx inc)
-          #_(update :db-after persistent!))
+          (update :db-after persistent!))
 
         :let [[entity & entities] es]
 

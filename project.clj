@@ -1,4 +1,4 @@
-(def version "1.8.0")
+(def version "1.8.1")
 
 (defproject datascript (str version (System/getenv "DATASCRIPT_CLASSIFIER"))
   :description "An implementation of Datomic in-memory database and Datalog query engine in ClojureScript"
@@ -9,7 +9,7 @@
   :dependencies [
     [org.clojure/clojure         "1.10.2"   :scope "provided"]
     [org.clojure/clojurescript   "1.10.844" :scope "provided"]
-    [persistent-sorted-set       "0.3.0"]
+    [persistent-sorted-set       "0.3.1"]
     [io.github.tonsky/extend-clj "0.1.0"]
   ]
   
